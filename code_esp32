@@ -1,0 +1,312 @@
+/********************************************************
+ * Projeto integrador V
+ * Monitor de Temperatura: Freezers e geladeiras
+ * Historico
+ * 27/10/2023 Revisao para compatibilidade de WiFiClientSecure e mySQL
+ ********************************************************
+ */
+
+// Bibliotecas ------------------------------------------
+#include <WiFi.h> // https://github.com/arduino-libraries/WiFi
+#include <HTTPClient.h>
+#include <PubSubClient.h> // Nick O'Leary
+#include <TimeLib.h> // Michael Morgolis
+
+//EEprom
+#include "EEPROM.h"
+
+//cristal liquido
+#include <Wire.h> 
+#include <LiquidCrystal_I2C.h>
+
+//sensor temperatura
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+#include <NTPClient.h> //https://github.com/taranais/NTPClient
+#include <WiFiUdp.h>
+
+// Set the LCD address to 0x27 for a 16 chars and 2 line display
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+//pino envio dados de temperatura
+#define DS18B20      14 // OK 
+
+/***INSTANCIANDO OBJETOS***********************************************************************************************************************************/
+// Sensor de Temperatura DS18B20
+
+//Instacia o Objeto oneWire e Seta o pino do Sensor para iniciar as leituras
+OneWire oneWire(DS18B20);
+
+//Repassa as referencias do oneWire para o Sensor Dallas (DS18B20)
+DallasTemperature Sensor(&oneWire);
+
+// Variavel para Armazenar os dados de Leitura
+float leitura;
+float max1 = 0.000;
+float min1 = 0.000;
+float max_alarme = 6.00;
+float min_alarme = 2.00;
+
+// variavel que registra a mensagem de erro
+String notificacao_txt = "ok";
+
+
+
+// Wi-Fi ------------------------------------------------
+const char*   ssid        = "Leonardo_2.4";
+const char*   password    = "leonardo87";
+
+
+int led = 32; // led indicador que não tem internet
+
+// servidor broker
+const char*   MQTT_SERVER             = "test.mosquitto.org";
+const int     MQTT_PORT               = 8883;
+
+
+// Cliente MQTT: tópicos de pulicação
+const char*   MQTT_CLIENT             = "PI_V_Monitor";
+// Topico temperatura
+const char*   MQTT_MAX_TEMP_TOPIC  = "PI_V_Monitor/maxima";
+// Topico umidade
+const char*   MQTT_MIN_TEMP_TOPIC     = "PI_V_Monitor/minima";
+// Topico iluminancia
+const char*   MQTT_ATUAL_TEMP_TOPIC     = "PI_V_Monitor/atual";
+// Topico atualizacao
+const char*   MQTT_UPDATE_TOPIC       = "PI_V_Monitor/atualizacao";
+// Notificação de falha
+const char*   MQTT_NOTIFICACAO_TOPIC       = "PI_V_Monitor/notificacao";
+
+
+// Intervalo atualizacao dados MQTT
+const time_t     DATA_UPDATE_INT         = 5; // 5 =  5 segundos
+
+// Intervalo atualizacao dados mySQL
+//const time_t     DATA_UPDATE_INT_sql         = 300; //300 =  5 minutos // 60 = 1 minuto
+
+// Variaveis globais ------------------------------------
+// Data/Hora 
+time_t        dateTime                = 0;
+// Proxima atualizacao de dados
+time_t        nextDataUpdate          = 0;
+
+// Data/Hora mySQL
+time_t        dateTime_sql                = 0;
+// Proxima atualizacao de dados
+time_t        nextDataUpdate_sql          = 0;
+
+// Iluminação
+  String        lighting;
+
+// Instancias -------------------------------------------
+  WiFiClientSecure mqtt_Client; // conexão a rede para o MQTT
+ // WiFiClient sql_Client;        // conexão a rede para o mySQL
+
+// data e hora
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP);
+
+
+String data_hora(){
+        timeClient.update();
+        String data = timeClient.getFormattedDate();
+        data.replace("T", " ");
+        data.replace("Z", "");
+        return data;
+}
+
+
+
+PubSubClient eclient(MQTT_SERVER, MQTT_PORT, mqtt_Client);
+
+// enviar dados para obanco o MQTT mosquitto
+void send_mqtt()
+{
+
+          String data = timeClient.getFormattedDate();
+          data.replace("T", " ");
+          data.replace("Z", "");
+          lighting = "70";
+          // Temperatura
+          String        max_txt;
+          String        min_txt;
+          String        atual_txt;
+          
+
+        // Atualizar leitura dos sensores
+       
+          max_txt = String(max1, 2);
+          min_txt = String(min1, 2);
+          atual_txt = String(leitura, 2);
+
+              
+              // Publica dados no broker
+                eclient.publish(MQTT_MAX_TEMP_TOPIC,(char*) max_txt.c_str());
+                eclient.publish(MQTT_MIN_TEMP_TOPIC,(char*) min_txt.c_str());
+                eclient.publish(MQTT_ATUAL_TEMP_TOPIC,(char*) atual_txt.c_str());
+                eclient.publish(MQTT_UPDATE_TOPIC,(char*) data.c_str());
+                eclient.publish(MQTT_NOTIFICACAO_TOPIC,(char*) notificacao_txt.c_str());
+                                                                    
+                timeClient.update();              
+                log("Dados atualizados Max= " + max_txt + "\tMin=" + min_txt + "\tAtual=" + atual_txt + "\tat=" + data);    
+}
+
+
+String ipStr(const IPAddress &ip) {
+  // Retorna IPAddress como String "n.n.n.n"
+  String s = "";
+  for (byte b = 0; b < 3; b++) {
+    s += String((ip >> (8 * b)) & 0xFF) + ".";
+  }
+  s += String(((ip >> 8 * 3)) & 0xFF);
+  return s;
+}
+
+void log(const String &s) {
+        // Gera log no Monitor Serial
+        //timeClient.update();
+        Serial.println(timeClient.getFormattedDate() + " " + s);
+        Serial.println(s);
+}
+
+//reconectar quando  a conexão é perdida
+void reconnect() {
+        // Conecta ao Broker
+        while (!eclient.connected()) {
+          log("Connectando Broker MQTT...");
+          // Conecta
+          if (eclient.connect(MQTT_CLIENT)) {
+            log("Conectado");
+          } else {
+            // Falha na conexao
+            log("Falha");
+            
+            delay(5000);
+          }
+        }
+}
+
+void min_max(){
+    if(min1 == 0.000){
+    min1 = leitura;
+  }
+
+  if(max1 == 0.000){
+    max1 = leitura;
+  }
+
+  if(leitura < min1){
+    min1 = leitura;
+  }
+
+  if(leitura > max1){
+    max1 = leitura;
+  }
+}
+
+// condição em que a temperatura aumentou acima do limite
+void verifica_status(){
+
+    if(leitura > max_alarme){
+      notificacao_txt = "temperatura acima do esperado :" + String(leitura, 2) + " ºC";
+    } 
+    else if (leitura < min_alarme){
+      notificacao_txt = "temperatura abaixo do esperado :" + String(leitura, 2) + " ºC";
+    } else {
+      notificacao_txt = "ok";
+    }
+}
+
+// Setup ------------------INICIO------------------------------
+void setup() {
+        // Incializa
+        pinMode(led, OUTPUT);
+        Serial.begin(115200);
+        log("--- Monitor Ambiental: Temperatura e umidade ---");
+        // initialize the LCD
+	      lcd.begin();
+        // Inicia o Sensor
+        Sensor.begin();
+
+        timeClient.setTimeOffset(-10800);
+
+
+        // Conecta Wi-Fi e a internet
+        log("Conectando WiFi");
+        WiFi.begin(ssid, password);
+        while (WiFi.status() != WL_CONNECTED) {
+          delay(500);
+          Serial.print(".");
+          digitalWrite(led, HIGH);
+        }
+        Serial.println();
+        log("Conectado IP: " + ipStr(WiFi.localIP()));
+         digitalWrite(led, LOW);
+
+        // Instrui Cliente a ignorar assinatura do Servidor na conexao segura
+        mqtt_Client.setInsecure();
+
+        // inicia o DHT11 - temperatura e umidade        
+        //dht.begin();
+        
+
+        log("Pronto");
+        // Turn on the blacklight and print a message.
+        lcd.backlight();
+        lcd.print("Temp-Atual:00.00");
+        lcd.setCursor(0, 1);  //(coluna,linha)
+        lcd.print("Mi:00.00Ma:00.00");
+}
+
+// Loop -------------------------------------------------
+void loop() {
+        // Processa conexao ao Broker
+        if (eclient.connected()) {
+          digitalWrite(led, LOW);
+          eclient.loop();
+       
+          
+        } else {
+          reconnect();
+          digitalWrite(led, HIGH);
+        }
+
+        // Atualiza data/hora
+        dateTime = now();
+
+
+
+
+        if (dateTime > nextDataUpdate) {
+          //atualizar data
+          timeClient.update();
+          send_mqtt();
+          // Proxima atualizacao
+          nextDataUpdate = dateTime +  DATA_UPDATE_INT;
+        }
+
+
+        // Leitura do Sensor  DS18B20  //////////////
+        Sensor.requestTemperatures();
+        // Armazerna na variavel o valor da Leitura
+        leitura = Sensor.getTempCByIndex(0);
+        min_max();
+
+
+        //imprime Leitura atual
+        lcd.setCursor(11, 0);  //posisionar cursor (coluna,linha)
+        lcd.print(leitura);
+
+        // imprime valor minimo
+        lcd.setCursor(3, 1);  //posisionar cursor (coluna,linha)
+        lcd.print(min1);
+
+        // imprime valor minimo
+        lcd.setCursor(11, 1);  //posisionar cursor (coluna,linha)
+        lcd.print(max1);
+
+        // verifica a temperatura
+        verifica_status();
+
+}
